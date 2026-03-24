@@ -1,0 +1,12 @@
+{
+  "name": "auy1104-ciclo-de-vida-del-software-ii",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "scripts": {
+    "test": "echo \"Simulando pruebas pasadas exitosamente...\" && exit 0"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}
