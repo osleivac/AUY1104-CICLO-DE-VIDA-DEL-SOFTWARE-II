@@ -1,0 +1,38 @@
+name: Build and Test (Optimized)
+on:
+  push:
+    branches:
+      - master
+  pull_request:
+    types: [opened, reopened, synchronize] # Activadores para CI
+
+jobs:
+  Build_Test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: ⬇️ Checkout del Código
+        uses: actions/checkout@v4
+
+      # 1. ⚙️ Configuración de Node.js v20 con Caché Integrada
+      # Usamos el parámetro 'cache: npm' en 'setup-node' para la mejor optimización.
+      # Esto maneja automáticamente las carpetas de caché (~/.npm) basado en package-lock.json.
+      - name: ⚙️ Configurar Node.js v20 con Caché
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm' 
+          
+      # 2. 📦 Instalación de Dependencias 
+      # npm ci siempre debe correr. Si la caché se restauró, este paso es instantáneo.
+      - name: 📦 Instalar Dependencias (npm ci)
+        run: npm ci
+      
+      # 3. 🔒 Auditoría y Pruebas (Solo en PR)
+      # Estos pasos solo se ejecutan si el evento es un Pull Request.
+      - name: 🔒 Verificar Compliance (Solo en PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        run: npm audit
+
+      - name: 🧪 Ejecutar Pruebas Automatizadas (Unidad/Integración)
+        if: ${{ github.event_name == 'pull_request' }}
+        run: npm test
