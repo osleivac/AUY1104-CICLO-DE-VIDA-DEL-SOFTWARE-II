@@ -59,7 +59,7 @@ measure_rollout() {
 # ── Métricas por estrategia ─────────────────────────────────────────────────
 collect_rolling() {
   log "Recolectando métricas: Rolling Update"
-  local DEPLOY="rolling-deployment"
+  local DEPLOY="duoc-app-deployment"
 
   T_ROLLOUT=$(measure_rollout "$DEPLOY")
   LB_HOST=$(wait_for_lb)
@@ -78,7 +78,7 @@ collect_rolling() {
 
 collect_recreate() {
   log "Recolectando métricas: Recreate (All-In-Once)"
-  local DEPLOY="allinonce-deployment"
+  local DEPLOY="duoc-app-deployment"
 
   # Detectar inicio de downtime (pods terminando)
   local DT_START=$SECONDS
@@ -124,9 +124,9 @@ collect_canary() {
 
   # Promoción a 100%
   local START_PROM=$SECONDS
-  kubectl scale deployment canary-v2 --replicas=9 -n "$NAMESPACE"
-  kubectl scale deployment canary-v1 --replicas=1 -n "$NAMESPACE"
-  kubectl rollout status deployment/canary-v2 --timeout=180s &>/dev/null
+  kubectl scale deployment duoc-app-canary-v2 --replicas=9
+  kubectl scale deployment duoc-app-stable-v1 --replicas=1
+  kubectl rollout status deployment/duoc-app-canary-v2
   T_PROMOTION=$((SECONDS - START_PROM))
 
   echo ""
@@ -146,7 +146,7 @@ collect_bluegreen() {
 
   # Tiempo deploy Green
   local START_GREEN=$SECONDS
-  kubectl rollout status deployment/green-deployment \
+  kubectl rollout status deployment/duoc-app-green \
     --timeout=180s -n "$NAMESPACE" &>/dev/null || true
   T_GREEN=$((SECONDS - START_GREEN))
 
@@ -157,7 +157,7 @@ collect_bluegreen() {
 
   # Switch
   local START_SWITCH=$SECONDS
-  kubectl patch service bluegreen-service -n "$NAMESPACE" \
+  kubectl patch service duoc-app-bg-service -n "$NAMESPACE" \
     -p '{"spec":{"selector":{"version":"green"}}}'
   T_SWITCH=$((SECONDS - START_SWITCH))
 

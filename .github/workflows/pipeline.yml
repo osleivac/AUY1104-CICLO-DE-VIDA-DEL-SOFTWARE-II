@@ -167,16 +167,13 @@ jobs:
               -e "s|\$ECR_URI_V2|${ECR_URI_V2}|g" \
               {} \;
 
-      # ── Rolling Update ──────────────────────
+# ── Rolling Update ──────────────────────
       - name: Deploy Rolling Update
         if: env.STRATEGY == 'rolling'
         run: |
           echo "▶ Aplicando estrategia: Rolling Update"
-          chmod +x EA2/ACT2.2/ROLLING-UPDATE/rolling-update.sh
-          # Deploy V1
           kubectl apply -f EA2/ACT2.2/ROLLING-UPDATE/rolling-update.yaml
-          kubectl rollout status deployment/rolling-deployment --timeout=300s
-          # Deploy V2 (activa el rolling)
+          kubectl rollout status deployment/duoc-app-deployment --timeout=300s
           sed -i "s|${ECR_URI_V1}|${ECR_URI_V2}|g" \
             EA2/ACT2.2/ROLLING-UPDATE/rolling-update.yaml
           sh EA2/ACT2.2/ROLLING-UPDATE/rolling-update.sh
@@ -187,7 +184,7 @@ jobs:
         run: |
           echo "▶ Aplicando estrategia: Recreate (All-In-Once)"
           kubectl apply -f EA2/ACT2.2/ALL-IN-ONCE/all-in-once.yaml
-          kubectl rollout status deployment/allinonce-deployment --timeout=300s
+          kubectl rollout status deployment/duoc-app-deployment --timeout=300s
           sed -i "s|${ECR_URI_V1}|${ECR_URI_V2}|g" \
             EA2/ACT2.2/ALL-IN-ONCE/all-in-once.yaml
           sh EA2/ACT2.2/ALL-IN-ONCE/all-in-once.sh
@@ -198,7 +195,9 @@ jobs:
         run: |
           echo "▶ Aplicando estrategia: Canary"
           kubectl apply -f EA2/ACT2.2/CANARY/canary.yaml
-          kubectl get pods -l version=canary
+          kubectl rollout status deployment/duoc-app-stable-v1 --timeout=300s
+          kubectl rollout status deployment/duoc-app-canary-v2 --timeout=300s
+          kubectl get pods
           kubectl get svc
           sh EA2/ACT2.2/CANARY/canary.sh
 
@@ -208,6 +207,8 @@ jobs:
         run: |
           echo "▶ Aplicando estrategia: Blue/Green"
           kubectl apply -f EA2/ACT2.2/BLUE-GREEN/blue-green.yaml
+          kubectl rollout status deployment/duoc-app-blue --timeout=300s
+          kubectl rollout status deployment/duoc-app-green --timeout=300s
           kubectl get pods
           kubectl get svc
           sh EA2/ACT2.2/BLUE-GREEN/blue-green.sh
