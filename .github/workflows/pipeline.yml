@@ -1,68 +1,262 @@
-name: CI/CD Pipeline to AWS ECR
+name: CI/CD Pipeline - EKS Deploy
 
 on:
   push:
-    branches: [ "master", "main" ]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      deploy_strategy:
+        description: 'Estrategia de despliegue'
+        required: true
+        default: 'rolling'
+        type: choice
+        options:
+          - rolling
+          - recreate
+          - canary
+          - blue-green
 
 env:
-  # ATENCIÓN: Cambia esto por el nombre de tu repositorio en AWS ECR
-  ECR_REPOSITORY_NAME: "app-cicd-duoc" 
+  AWS_REGION: us-east-1
+  ECR_REPO: duoc-lab
+  CLUSTER_NAME: duoc-eks-cluster-cli
+  IMAGE_TAG_V1: v1.0
+  IMAGE_TAG_V2: v2.0
 
 jobs:
-  # ==========================================
-  # FASE 1: CI - VALIDACIÓN DEL CÓDIGO
-  # ==========================================
-  ci_validation:
-    name: 🔒 Compliance & 🧪 Tests
+  # ─────────────────────────────────────────
+  # STAGE 1: CI - Lint y Tests
+  # ─────────────────────────────────────────
+  ci:
+    name: CI - Build & Test
     runs-on: ubuntu-latest
-    steps:
-      - name: Checkout del código
-        uses: actions/checkout@v4
-      
-      - name: Setup Node.js v20
-        uses: actions/setup-node@v4
-        with:
-          node-version: '20'
-          cache: 'npm'
-          
-      - name: Instalar Dependencias
-        run: npm ci
-        
-      # Ejecutamos pruebas y auditoría. Si alguno falla, el job se detiene.
-      - name: Ejecutar Auditoría de Seguridad
-        run: npm audit --audit-level=critical
-        
-      - name: Ejecutar Pruebas
-        run: npm test
+    outputs:
+      ecr_uri_v1: ${{ steps.ecr-meta.outputs.ecr_uri_v1 }}
+      ecr_uri_v2: ${{ steps.ecr-meta.outputs.ecr_uri_v2 }}
+      account_id: ${{ steps.ecr-meta.outputs.account_id }}
 
-  # ==========================================
-  # FASE 2: CD - CONTENERIZACIÓN Y REGISTRO
-  # ==========================================
-  cd_build_push:
-    name: 🐳 Build & Push a Amazon ECR
-    runs-on: ubuntu-latest
-    needs: [ci_validation] # Este es el GATE: requiere que CI pase exitosamente
-    
     steps:
-      - name: Checkout del código
+      - name: Checkout código fuente
         uses: actions/checkout@v4
 
-      - name: Configurar Credenciales AWS
-        uses: aws-actions/configure-aws-credentials@v5.1.0
+      - name: Lint Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
         with:
-          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          dockerfile: Dockerfile
+          failure-threshold: warning
+
+      - name: Lint manifiestos YAML (kubeval)
+        run: |
+          curl -sL https://github.com/instrumenta/kubeval/releases/latest/download/kubeval-linux-amd64.tar.gz \
+            | tar xz -C /tmp
+          sudo mv /tmp/kubeval /usr/local/bin/
+          find EA2/ACT2.2 -name "*.yaml" -exec kubeval {} \;
+
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
           aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
-          aws-session-token: ${{ secrets.AWS_SESSION_TOKEN }}
-          aws-region: "us-east-1"
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
 
       - name: Login en Amazon ECR
         id: login-ecr
         uses: aws-actions/amazon-ecr-login@v2
 
-      - name: Build, Tag, y Push de la imagen
-        env:
-          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
-          IMAGE_TAG: ${{ github.sha }}
+      - name: Construir y pushear imagen V1 (Blue)
+        id: ecr-meta
         run: |
-          docker build -t $ECR_REGISTRY/${{ env.ECR_REPOSITORY_NAME }}:$IMAGE_TAG .
-          docker push $ECR_REGISTRY/${{ env.ECR_REPOSITORY_NAME }}:$IMAGE_TAG
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          ECR_URI_V1="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG_V1}"
+          ECR_URI_V2="${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}:${IMAGE_TAG_V2}"
+
+          # Crear repositorio si no existe
+          aws ecr describe-repositories --repository-names $ECR_REPO 2>/dev/null || \
+            aws ecr create-repository --repository-name $ECR_REPO
+
+          # Build V1
+          docker build -t $ECR_URI_V1 --build-arg BUILD_COLOR="Blue" .
+          docker push $ECR_URI_V1
+          echo "Pushed V1: $ECR_URI_V1"
+
+          # Build V2
+          docker build -t $ECR_URI_V2 --build-arg BUILD_COLOR="Green" .
+          docker push $ECR_URI_V2
+          echo "Pushed V2: $ECR_URI_V2"
+
+          # Outputs para stages siguientes
+          echo "ecr_uri_v1=$ECR_URI_V1"   >> $GITHUB_OUTPUT
+          echo "ecr_uri_v2=$ECR_URI_V2"   >> $GITHUB_OUTPUT
+          echo "account_id=$ACCOUNT_ID"   >> $GITHUB_OUTPUT
+
+  # ─────────────────────────────────────────
+  # STAGE 2: Preparar EKS
+  # ─────────────────────────────────────────
+  prepare-eks:
+    name: Preparar kubeconfig EKS
+    needs: ci
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Configurar credenciales AWS
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Instalar kubectl v1.30
+        run: |
+          curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+
+      - name: Verificar clúster EKS activo
+        run: |
+          STATUS=$(aws eks describe-cluster \
+            --name $CLUSTER_NAME \
+            --query 'cluster.status' \
+            --output text)
+          echo "Estado del clúster: $STATUS"
+          if [ "$STATUS" != "ACTIVE" ]; then
+            echo "ERROR: El clúster no está en estado ACTIVE"
+            exit 1
+          fi
+
+      - name: Configurar kubeconfig
+        run: |
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+          kubectl get nodes
+
+  # ─────────────────────────────────────────
+  # STAGE 3: Deploy con estrategia elegida
+  # ─────────────────────────────────────────
+  deploy:
+    name: Deploy → ${{ github.event.inputs.deploy_strategy || 'rolling' }}
+    needs: [ci, prepare-eks]
+    runs-on: ubuntu-latest
+    env:
+      STRATEGY: ${{ github.event.inputs.deploy_strategy || 'rolling' }}
+      ECR_URI_V1: ${{ needs.ci.outputs.ecr_uri_v1 }}
+      ECR_URI_V2: ${{ needs.ci.outputs.ecr_uri_v2 }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS + kubectl
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - run: |
+          curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+
+      - name: Inyectar URIs de imagen en manifiestos
+        run: |
+          # Reemplaza los placeholders en todos los YAML de las 4 estrategias
+          find EA2/ACT2.2 -name "*.yaml" -exec \
+            sed -i \
+              -e "s|\$ECR_URI_V1|${ECR_URI_V1}|g" \
+              -e "s|\$ECR_URI_V2|${ECR_URI_V2}|g" \
+              {} \;
+
+      # ── Rolling Update ──────────────────────
+      - name: Deploy Rolling Update
+        if: env.STRATEGY == 'rolling'
+        run: |
+          echo "▶ Aplicando estrategia: Rolling Update"
+          chmod +x EA2/ACT2.2/ROLLING-UPDATE/rolling-update.sh
+          # Deploy V1
+          kubectl apply -f EA2/ACT2.2/ROLLING-UPDATE/rolling-update.yaml
+          kubectl rollout status deployment/rolling-deployment --timeout=300s
+          # Deploy V2 (activa el rolling)
+          sed -i "s|${ECR_URI_V1}|${ECR_URI_V2}|g" \
+            EA2/ACT2.2/ROLLING-UPDATE/rolling-update.yaml
+          sh EA2/ACT2.2/ROLLING-UPDATE/rolling-update.sh
+
+      # ── Recreate (All-In-Once) ──────────────
+      - name: Deploy Recreate
+        if: env.STRATEGY == 'recreate'
+        run: |
+          echo "▶ Aplicando estrategia: Recreate (All-In-Once)"
+          kubectl apply -f EA2/ACT2.2/ALL-IN-ONCE/all-in-once.yaml
+          kubectl rollout status deployment/allinonce-deployment --timeout=300s
+          sed -i "s|${ECR_URI_V1}|${ECR_URI_V2}|g" \
+            EA2/ACT2.2/ALL-IN-ONCE/all-in-once.yaml
+          sh EA2/ACT2.2/ALL-IN-ONCE/all-in-once.sh
+
+      # ── Canary ─────────────────────────────
+      - name: Deploy Canary
+        if: env.STRATEGY == 'canary'
+        run: |
+          echo "▶ Aplicando estrategia: Canary"
+          kubectl apply -f EA2/ACT2.2/CANARY/canary.yaml
+          kubectl get pods -l version=canary
+          kubectl get svc
+          sh EA2/ACT2.2/CANARY/canary.sh
+
+      # ── Blue/Green ──────────────────────────
+      - name: Deploy Blue/Green
+        if: env.STRATEGY == 'blue-green'
+        run: |
+          echo "▶ Aplicando estrategia: Blue/Green"
+          kubectl apply -f EA2/ACT2.2/BLUE-GREEN/blue-green.yaml
+          kubectl get pods
+          kubectl get svc
+          sh EA2/ACT2.2/BLUE-GREEN/blue-green.sh
+
+  # ─────────────────────────────────────────
+  # STAGE 4: Captura y reporte de métricas
+  # ─────────────────────────────────────────
+  metrics:
+    name: Métricas y tabla comparativa
+    needs: deploy
+    runs-on: ubuntu-latest
+    if: always()
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar AWS + kubectl
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-session-token:     ${{ secrets.AWS_SESSION_TOKEN }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - run: |
+          curl -LO "https://dl.k8s.io/release/v1.30.0/bin/linux/amd64/kubectl"
+          chmod +x kubectl && sudo mv kubectl /usr/local/bin/
+          aws eks update-kubeconfig --name $CLUSTER_NAME --region $AWS_REGION
+
+      - name: Recopilar métricas
+        run: |
+          chmod +x EA2/ACT2.2/scripts/metrics-collector.sh
+          STRATEGY="${{ github.event.inputs.deploy_strategy || 'rolling' }}" \
+            bash EA2/ACT2.2/scripts/metrics-collector.sh \
+            | tee metrics-report.txt
+
+      - name: Publicar métricas como summary
+        run: |
+          echo "## Reporte de métricas - Estrategia: \
+            ${{ github.event.inputs.deploy_strategy || 'rolling' }}" \
+            >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat metrics-report.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Guardar reporte como artefacto
+        uses: actions/upload-artifact@v4
+        with:
+          name: metrics-${{ github.event.inputs.deploy_strategy || 'rolling' }}-${{ github.run_number }}
+          path: metrics-report.txt
+          retention-days: 30
