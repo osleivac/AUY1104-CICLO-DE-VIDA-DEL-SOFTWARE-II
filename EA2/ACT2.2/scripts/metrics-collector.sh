@@ -6,6 +6,17 @@ NAMESPACE=${NAMESPACE:-default}
 LB_TIMEOUT=300
 POLL_INTERVAL=5
 
+# Variables globales para la tabla
+R_LB="[Pend]"; R_ROLLOUT="[Pend]"; R_SWITCH="[Pend]"
+R_DOWNTIME="[Pend]"; R_ROLLBACK="[Pend]"; R_RIESGO="[Pend]"
+RC_LB="[Pend]"; RC_ROLLOUT="N/A"; RC_SWITCH="N/A"
+RC_DOWNTIME="[Pend]"; RC_ROLLBACK="[Pend]"; RC_RIESGO="[Pend]"
+CA_LB="[Pend]"; CA_ROLLOUT="[Pend]"; CA_SWITCH="Gradual"
+CA_DOWNTIME="0s"; CA_ROLLBACK="[Pend]"; CA_RIESGO="10%"
+BG_LB="[Pend]"; BG_ROLLOUT="[Pend]"; BG_SWITCH="[Pend]"
+BG_DOWNTIME="0s"; BG_ROLLBACK="Instantaneo"; BG_RIESGO="0%"
+LB_PROVISIONING_DURATION=0
+
 log() { echo "[$(date +%H:%M:%S)] $*"; }
 
 get_lb_hostname() {
@@ -49,9 +60,11 @@ measure_rollout() {
 
 collect_rolling() {
   log "Recolectando metricas: Rolling Update"
+  local T_ROLLOUT T_LB_PROP LB_HOST
   T_ROLLOUT=$(measure_rollout "duoc-app-deployment")
   LB_HOST=$(wait_for_lb)
   T_LB_PROP=$(wait_for_http_200 "$LB_HOST")
+
   echo ""
   echo "=============================================="
   echo "  METRICAS - Rolling Update"
@@ -62,9 +75,11 @@ collect_rolling() {
   printf "%-45s %s\n" "C2. Tiempo TOTAL (Apply a 200 OK):"     "$((T_ROLLOUT + T_LB_PROP))s"
   printf "%-45s %s\n" "D. Downtime:"                           "0s"
   echo "=============================================="
-  R_LB=$LB_PROVISIONING_DURATION
-  R_ROLLOUT=$T_ROLLOUT
-  R_SWITCH=$T_LB_PROP
+
+  # Asignar globales
+  R_LB="${LB_PROVISIONING_DURATION}s"
+  R_ROLLOUT="${T_ROLLOUT}s"
+  R_SWITCH="${T_LB_PROP}s"
   R_DOWNTIME="0s"
   R_ROLLBACK="Alto"
   R_RIESGO="100%"
@@ -72,13 +87,15 @@ collect_rolling() {
 
 collect_recreate() {
   log "Recolectando metricas: Recreate"
-  local DT_START=$SECONDS
+  local DT_START T_ROLLOUT T_LB_PROP LB_HOST DOWNTIME
+  DT_START=$SECONDS
   kubectl wait pod -n "$NAMESPACE" \
     -l app=duoc-app --for=delete --timeout=120s &>/dev/null || true
   DOWNTIME=$((SECONDS - DT_START))
   T_ROLLOUT=$(measure_rollout "duoc-app-deployment")
   LB_HOST=$(wait_for_lb)
   T_LB_PROP=$(wait_for_http_200 "$LB_HOST")
+
   echo ""
   echo "=============================================="
   echo "  METRICAS - Recreate (All-In-Once)"
@@ -88,7 +105,8 @@ collect_recreate() {
   printf "%-45s %s\n" "C1. Provisionamiento del LB (1ra vez):" "${LB_PROVISIONING_DURATION}s"
   printf "%-45s %s\n" "C2. Tiempo TOTAL hasta recuperacion:"   "${T_LB_PROP}s"
   echo "=============================================="
-  RC_LB=$LB_PROVISIONING_DURATION
+
+  RC_LB="${LB_PROVISIONING_DURATION}s"
   RC_ROLLOUT="N/A"
   RC_SWITCH="N/A"
   RC_DOWNTIME="${DOWNTIME}s"
@@ -98,17 +116,19 @@ collect_recreate() {
 
 collect_canary() {
   log "Recolectando metricas: Canary"
-  local START_CANARY=$SECONDS
+  local START_CANARY T_CANARY LB_HOST START_PROM T_PROMOTION T_LB_PROP
+  START_CANARY=$SECONDS
   kubectl wait pod -n "$NAMESPACE" \
     -l app=duoc-app-canary --for=condition=Ready --timeout=180s &>/dev/null || true
   T_CANARY=$((SECONDS - START_CANARY))
   LB_HOST=$(wait_for_lb)
-  local START_PROM=$SECONDS
+  START_PROM=$SECONDS
   kubectl scale deployment duoc-app-canary-v2 --replicas=9 -n "$NAMESPACE" &>/dev/null || true
   kubectl scale deployment duoc-app-stable-v1 --replicas=1 -n "$NAMESPACE" &>/dev/null || true
   kubectl rollout status deployment/duoc-app-canary-v2 --timeout=180s &>/dev/null || true
   T_PROMOTION=$((SECONDS - START_PROM))
   T_LB_PROP=$(wait_for_http_200 "$LB_HOST")
+
   echo ""
   echo "=============================================="
   echo "  METRICAS - Canary"
@@ -119,8 +139,9 @@ collect_canary() {
   printf "%-45s %s\n" "D. Downtime:"                           "0s"
   printf "%-45s %s\n" "E. Tiempo TOTAL:"                       "$((T_CANARY + T_PROMOTION))s"
   echo "=============================================="
-  CA_LB=$LB_PROVISIONING_DURATION
-  CA_ROLLOUT=$T_CANARY
+
+  CA_LB="${LB_PROVISIONING_DURATION}s"
+  CA_ROLLOUT="${T_CANARY}s"
   CA_SWITCH="Gradual"
   CA_DOWNTIME="0s"
   CA_ROLLBACK="${T_PROMOTION}s"
@@ -129,19 +150,21 @@ collect_canary() {
 
 collect_bluegreen() {
   log "Recolectando metricas: Blue/Green"
-  local START_GREEN=$SECONDS
+  local START_GREEN T_GREEN T_WAIT START_SWITCH T_SWITCH LB_HOST T_PROP
+  START_GREEN=$SECONDS
   kubectl rollout status deployment/duoc-app-green \
     --timeout=180s -n "$NAMESPACE" &>/dev/null || true
   T_GREEN=$((SECONDS - START_GREEN))
   log "Periodo de testeo Green (120s)..."
   sleep 120
   T_WAIT=120
-  local START_SWITCH=$SECONDS
+  START_SWITCH=$SECONDS
   kubectl patch service duoc-app-bg-service -n "$NAMESPACE" \
     -p '{"spec":{"selector":{"version":"green"}}}' &>/dev/null || true
   T_SWITCH=$((SECONDS - START_SWITCH))
   LB_HOST=$(wait_for_lb)
   T_PROP=$(wait_for_http_200 "$LB_HOST")
+
   echo ""
   echo "=============================================="
   echo "  METRICAS - Blue/Green"
@@ -154,8 +177,9 @@ collect_bluegreen() {
   printf "%-45s %s\n" "F. Downtime:"                           "0s"
   printf "%-45s %s\n" "G. Provisionamiento del LB (1ra vez):"  "${LB_PROVISIONING_DURATION}s"
   echo "=============================================="
-  BG_LB=$LB_PROVISIONING_DURATION
-  BG_ROLLOUT=$T_GREEN
+
+  BG_LB="${LB_PROVISIONING_DURATION}s"
+  BG_ROLLOUT="${T_GREEN}s"
   BG_SWITCH="${T_SWITCH}s"
   BG_DOWNTIME="0s"
   BG_ROLLBACK="Instantaneo"
@@ -174,43 +198,27 @@ print_table() {
     "--------------" "------------" "------------" "------------"
   printf "| %-44s | %-14s | %-12s | %-12s | %-12s |\n" \
     "Tiempo Infraestructura (LB)" \
-    "${R_LB:-[Pend]}s" "${RC_LB:-[Pend]}s" \
-    "${BG_LB:-[Pend]}s" "${CA_LB:-[Pend]}s"
+    "$R_LB" "$RC_LB" "$BG_LB" "$CA_LB"
   printf "| %-44s | %-14s | %-12s | %-12s | %-12s |\n" \
     "Tiempo Despliegue Interno (Rollout K8s)" \
-    "${R_ROLLOUT:-[Pend]}s" "${RC_ROLLOUT:-N/A}" \
-    "${BG_ROLLOUT:-[Pend]}s" "${CA_ROLLOUT:-[Pend]}s"
+    "$R_ROLLOUT" "$RC_ROLLOUT" "$BG_ROLLOUT" "$CA_ROLLOUT"
   printf "| %-44s | %-14s | %-12s | %-12s | %-12s |\n" \
     "Velocidad Switch / Rollout Activo" \
-    "${R_SWITCH:-[Pend]}s" "${RC_SWITCH:-N/A}" \
-    "${BG_SWITCH:-[Pend]}" "${CA_SWITCH:-Gradual}"
+    "$R_SWITCH" "$RC_SWITCH" "$BG_SWITCH" "$CA_SWITCH"
   printf "| %-44s | %-14s | %-12s | %-12s | %-12s |\n" \
     "Downtime" \
-    "${R_DOWNTIME:-0s}" "${RC_DOWNTIME:-[Pend]}" \
-    "${BG_DOWNTIME:-0s}" "${CA_DOWNTIME:-0s}"
+    "$R_DOWNTIME" "$RC_DOWNTIME" "$BG_DOWNTIME" "$CA_DOWNTIME"
   printf "| %-44s | %-14s | %-12s | %-12s | %-12s |\n" \
     "Velocidad Mitigacion / Rollback" \
-    "${R_ROLLBACK:-Alto}" "${RC_ROLLBACK:-Alto}" \
-    "${BG_ROLLBACK:-Instantaneo}" "${CA_ROLLBACK:-[Pend]}"
+    "$R_ROLLBACK" "$RC_ROLLBACK" "$BG_ROLLBACK" "$CA_ROLLBACK"
   printf "| %-44s | %-14s | %-12s | %-12s | %-12s |\n" \
     "Riesgo de Exposicion al Bug" \
-    "${R_RIESGO:-100%}" "${RC_RIESGO:-100%}" \
-    "${BG_RIESGO:-0%}" "${CA_RIESGO:-10%}"
+    "$R_RIESGO" "$RC_RIESGO" "$BG_RIESGO" "$CA_RIESGO"
   echo ""
 }
 
 # Main
 log "Iniciando recoleccion de metricas - Estrategia: ${STRATEGY}"
-
-R_LB="[Pend]"; R_ROLLOUT="[Pend]"; R_SWITCH="[Pend]"
-R_DOWNTIME="[Pend]"; R_ROLLBACK="[Pend]"; R_RIESGO="[Pend]"
-RC_LB="[Pend]"; RC_ROLLOUT="[Pend]"; RC_SWITCH="[Pend]"
-RC_DOWNTIME="[Pend]"; RC_ROLLBACK="[Pend]"; RC_RIESGO="[Pend]"
-CA_LB="[Pend]"; CA_ROLLOUT="[Pend]"; CA_SWITCH="[Pend]"
-CA_DOWNTIME="[Pend]"; CA_ROLLBACK="[Pend]"; CA_RIESGO="[Pend]"
-BG_LB="[Pend]"; BG_ROLLOUT="[Pend]"; BG_SWITCH="[Pend]"
-BG_DOWNTIME="[Pend]"; BG_ROLLBACK="[Pend]"; BG_RIESGO="[Pend]"
-LB_PROVISIONING_DURATION=0
 
 case "$STRATEGY" in
   rolling)    collect_rolling   ;;
