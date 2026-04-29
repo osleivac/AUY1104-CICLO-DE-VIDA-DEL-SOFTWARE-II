@@ -243,7 +243,7 @@ jobs:
         run: |
           chmod +x EA2/ACT2.2/scripts/metrics-collector.sh
           STRATEGY="${{ github.event.inputs.deploy_strategy || 'rolling' }}" \
-            bash EA2/ACT2.2/scripts/metrics-collector.sh \
+            bash -x EA2/ACT2.2/scripts/metrics-collector.sh \
             | tee metrics-report.txt
 
       - name: Publicar métricas como summary
